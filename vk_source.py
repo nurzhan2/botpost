@@ -69,6 +69,7 @@ def listen_vk():
                     peer, text, mid = msg.peer_id, msg.text, msg.id
                 if target and peer != target:
                     continue
+                logging.info("VK получено: peer=%s mid=%s text=%r", peer, mid, text[:80])
                 _enqueue(text, mid)
         except Exception as e:
             logging.exception("VK Long Poll error: %s", e)
