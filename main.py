@@ -10,7 +10,7 @@ from apscheduler.triggers.cron import CronTrigger
 import config
 import db
 from bot import bot, dp, post_special, post_digest
-from vk_source import listen_vk
+from vk_source import poll_vk
 
 
 async def post_job():
@@ -32,7 +32,7 @@ async def main():
     sched.start()
 
     # VK читается в отдельном потоке (Long Poll блокирующий); если VK выключен — поток сразу выйдет
-    threading.Thread(target=listen_vk, daemon=True).start()
+    threading.Thread(target=poll_vk, daemon=True).start()
 
     logging.info("Бот запущен. Слушаю источник, публикация в %s", config.POST_TIME)
     await dp.start_polling(bot)
