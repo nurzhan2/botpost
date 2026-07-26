@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Чтение VK-беседы через сообщество-бота.
+Чтение VK-беседы через Bots Long Poll сообщества.
 
-Важно: обычный Bots Long Poll в беседе отдаёт боту ТОЛЬКО упоминания,
-если сообщество не админ беседы (а новый VK не даёт назначить бота админом).
-Поэтому читаем беседу опросом истории: messages.getHistory токеном сообщества.
-Сообщество — участник беседы, значит видит всю переписку, без упоминаний.
+Чтобы бот получал ВСЕ сообщения беседы (а не только упоминания),
+сообщество должно быть АДМИНИСТРАТОРОМ беседы — это требование VK.
 """
 import os
+import re
 import time
 import datetime
 import logging
@@ -17,7 +16,9 @@ import db
 from filters import is_news, special_reason
 
 VK_TOKEN = os.environ.get("VK_GROUP_TOKEN", "")
-POLL_EVERY_SEC = 60          # как часто опрашивать беседу
+
+# убрать префикс-упоминание вида [club240473090|@club240473090]
+_mention_re = re.compile(r"\[(?:club|public|id)\d+\|[^\]]*\]\s*")
 
 
 def _peer_id() -> int:
@@ -25,6 +26,11 @@ def _peer_id() -> int:
 
 
 def _enqueue(text: str, mid):
+    if mid is not None and db.is_seen("vk", mid):
+        return
+    if mid is not None:
+        db.mark_seen("vk", mid)
+    text = _mention_re.sub("", text or "").strip()
     if not is_news(text):
         return
     reason = special_reason(text)
@@ -33,43 +39,44 @@ def _enqueue(text: str, mid):
     logging.info("VK новость в очереди (%s): %r", kind, text[:60])
 
 
-def poll_vk():
-    """Опрос истории беседы. Запускать в отдельном потоке."""
-    if not VK_TOKEN or not config.VK_CHAT_ID:
-        logging.info("VK выключен (нет VK_GROUP_TOKEN / VK_CHAT_ID)")
+def listen_vk():
+    """Bots Long Poll сообщества. Запускать в отдельном потоке."""
+    if not VK_TOKEN or not config.VK_GROUP_ID:
+        logging.info("VK выключен (нет VK_GROUP_TOKEN / VK_GROUP_ID)")
         return
 
     import vk_api
+    from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
 
-    vk = vk_api.VkApi(token=VK_TOKEN).get_api()
-    peer = _peer_id()
-
-    # Первый проход — только запомнить текущие сообщения, чтобы не вывалить
-    # всю старую историю в канал. Но лишь если раньше VK-сообщений не видели.
-    # (старьё заливается отдельно через import_vk.py)
-    prime = db.max_seen_id("vk") == 0
-    logging.info("VK опрос беседы запущен (peer=%s, prime=%s)", peer, prime)
+    session = vk_api.VkApi(token=VK_TOKEN)
+    lp = VkBotLongPoll(session, group_id=config.VK_GROUP_ID)
+    target = _peer_id() if config.VK_CHAT_ID else None
+    logging.info("VK Long Poll запущен (target peer=%s)", target)
 
     while True:
         try:
-            resp = vk.messages.getHistory(peer_id=peer, count=50)
-            items = resp.get("items", [])
-            for m in reversed(items):            # старые -> новые
-                mid = m["id"]
-                if db.is_seen("vk", mid):
+            for event in lp.listen():
+                if event.type != VkBotEventType.MESSAGE_NEW:
                     continue
-                db.mark_seen("vk", mid)
-                if prime:
-                    continue                     # первый проход: только помечаем
-                _enqueue(m.get("text", ""), mid)
-            prime = False
+                msg = getattr(event, "message", None)
+                if msg is None:
+                    obj = event.object
+                    msg = obj.get("message", obj) if hasattr(obj, "get") else obj
+                if hasattr(msg, "get"):
+                    peer, text, mid = msg.get("peer_id"), msg.get("text", ""), msg.get("id")
+                else:
+                    peer, text, mid = msg.peer_id, msg.text, msg.id
+                if target and peer != target:
+                    continue
+                logging.info("VK получено: peer=%s mid=%s text=%r", peer, mid, (text or "")[:80])
+                _enqueue(text, mid)
         except Exception as e:
-            logging.exception("VK poll error: %s", e)
-        time.sleep(POLL_EVERY_SEC)
+            logging.exception("VK Long Poll error: %s", e)
+            time.sleep(5)
 
 
 def import_vk_history():
-    """Разовая заливка старых сообщений беседы (с VK_START_DATE)."""
+    """Разовая заливка старых сообщений беседы (работает, только если бот — админ беседы)."""
     if not VK_TOKEN or not config.VK_CHAT_ID:
         print("VK не настроен (VK_GROUP_TOKEN / VK_CHAT_ID)")
         return
@@ -95,7 +102,7 @@ def import_vk_history():
             if db.is_seen("vk", mid):
                 continue
             db.mark_seen("vk", mid)
-            text = m.get("text", "")
+            text = _mention_re.sub("", m.get("text", "")).strip()
             if not is_news(text):
                 continue
             reason = special_reason(text)
