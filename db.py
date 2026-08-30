@@ -64,6 +64,17 @@ def mark_seen(source, msg_id):
     con.close()
 
 
+def mark_seen_many(source, msg_ids):
+    """Пометить seen пачкой — нужно для альбомов: вся медиагруппа за раз."""
+    if not msg_ids:
+        return
+    con = _con()
+    con.executemany("INSERT OR IGNORE INTO seen (source, msg_id) VALUES (?,?)",
+                    [(source, i) for i in msg_ids])
+    con.commit()
+    con.close()
+
+
 def add_to_queue(source, chat_id, msg_id, text, kind, reason=""):
     con = _con()
     con.execute(

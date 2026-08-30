@@ -8,6 +8,7 @@
 Ограничение Bot API: бот видит только НОВЫЕ посты (после добавления в админы).
 Старые новости заливаются отдельно через import_history.py.
 """
+import asyncio
 import logging
 import os
 
@@ -49,24 +50,80 @@ def _is_source(message: Message) -> bool:
     return False
 
 
+# --- буфер медиагрупп (альбомов) ---------------------------------------
+# Альбом прилетает НЕСКОЛЬКИМИ channel_post с общим media_group_id, и подпись
+# есть только у одного из них — причём не обязательно у первого. Раньше каждое
+# сообщение проверялось поодиночке, у второго-десятого caption пустой -> is_news
+# False -> весь альбом терялся. Копим группу и обрабатываем целиком.
+ALBUM_DEBOUNCE_SEC = 2.0
+_album_buf = {}   # media_group_id -> {"msgs": [Message], "task": asyncio.Task}
+
+
+def _ctx(message: Message) -> str:
+    text = message.text or message.caption or ""
+    return "chat.id=%s chat.username=%s msg_id=%s media_group_id=%s text=%r" % (
+        message.chat.id, message.chat.username, message.message_id,
+        message.media_group_id, text[:80].replace("\n", " "),
+    )
+
+
 @dp.channel_post()
 async def on_channel_post(message: Message):
     """Новый пост в источнике -> фильтр -> очередь. Логируем КАЖДЫЙ шаг."""
-    text = message.text or message.caption or ""
-    head = text[:80].replace("\n", " ")
-    ctx = "chat.id=%s chat.username=%s msg_id=%s media_group_id=%s text=%r" % (
-        message.chat.id, message.chat.username, message.message_id,
-        message.media_group_id, head,
-    )
+    ctx = _ctx(message)
 
     if not _is_source(message):
         log.info("skip: not_source | %s", ctx)
         return
 
+    if message.media_group_id:
+        _buffer_album(message, ctx)
+        return
+
+    _handle(message, message.text or message.caption or "", [message.message_id], ctx)
+
+
+def _buffer_album(message: Message, ctx: str):
+    """Накопить сообщение альбома и перевзвести таймер на разбор всей группы."""
+    gid = message.media_group_id
+    slot = _album_buf.setdefault(gid, {"msgs": [], "task": None})
+    slot["msgs"].append(message)
+    if slot["task"] is not None:
+        slot["task"].cancel()
+    slot["task"] = asyncio.create_task(_flush_album_later(gid))
+    log.info("album: буферизую (в группе %d) | %s", len(slot["msgs"]), ctx)
+
+
+async def _flush_album_later(gid: str):
+    try:
+        await asyncio.sleep(ALBUM_DEBOUNCE_SEC)
+    except asyncio.CancelledError:
+        return   # пришло ещё одно фото группы — таймер перевзведён
+    slot = _album_buf.pop(gid, None)
+    if not slot or not slot["msgs"]:
+        return
+
+    msgs = slot["msgs"]
+    ids = [m.message_id for m in msgs]
+    # Берём текст оттуда, где он есть; носителем считаем именно то сообщение
+    # (его copy_message перенесёт с фото и подписью).
+    carrier = next((m for m in msgs if (m.text or m.caption or "").strip()), msgs[0])
+    text = carrier.text or carrier.caption or ""
+    log.info("album: группа %s собрана, сообщений=%d, подпись у msg_id=%s",
+             gid, len(msgs), carrier.message_id)
+    _handle(carrier, text, ids, _ctx(carrier))
+
+
+def _handle(message: Message, text: str, all_ids: list, ctx: str):
+    """Общий путь для одиночного поста и для собранного альбома.
+
+    all_ids — все message_id, которые надо пометить seen (для альбома это вся
+    группа: остальные кадры помечаются seen БЕЗ добавления в очередь).
+    """
     if db.is_seen("tg", message.message_id):
         log.info("skip: seen | %s", ctx)
         return
-    db.mark_seen("tg", message.message_id)
+    db.mark_seen_many("tg", all_ids)
 
     if not is_news(text):
         # Разделяем две очень разные причины: спам-словарь vs отсутствие маркера
@@ -81,7 +138,8 @@ async def on_channel_post(message: Message):
     reason = special_reason(text)
     kind = "special" if reason else "digest"
     db.add_to_queue("tg", message.chat.id, message.message_id, text, kind, reason or "")
-    log.info("queued: %s%s | %s", kind, (" (%s)" % reason) if reason else "", ctx)
+    log.info("queued: %s%s | seen_ids=%s | %s",
+             kind, (" (%s)" % reason) if reason else "", all_ids, ctx)
 
 
 async def post_special():
