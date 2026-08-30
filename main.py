@@ -26,6 +26,22 @@ async def post_job():
         logging.exception("[post] error: %s", e)
 
 
+def build_post_trigger() -> CronTrigger:
+    """Триггер ежедневной публикации.
+
+    ВАЖНО: таймзону обязательно передавать в САМ CronTrigger.
+    AsyncIOScheduler(timezone=...) применяется только когда триггер задан
+    алиасом ('cron'); готовый инстанс CronTrigger берёт таймзону машины
+    (на Railway это UTC) и джоба уезжает на 3 часа.
+
+    Вынесено в отдельную функцию, чтобы тест мог проверить таймзону,
+    не поднимая бота целиком.
+    """
+    tz = ZoneInfo(config.TZ)
+    hh, mm = config.POST_TIME.split(":")
+    return CronTrigger(hour=int(hh), minute=int(mm), timezone=tz)
+
+
 async def main():
     logging.basicConfig(
         level=logging.INFO,
@@ -33,18 +49,8 @@ async def main():
     )
     db.init()
 
-    # ВАЖНО: таймзону обязательно передавать в САМ CronTrigger.
-    # AsyncIOScheduler(timezone=...) применяется только когда триггер задан
-    # алиасом ('cron'); готовый инстанс CronTrigger берёт таймзону машины
-    # (на Railway это UTC) и джоба уезжает на 3 часа.
-    tz = ZoneInfo(config.TZ)
-    sched = AsyncIOScheduler(timezone=tz)
-    hh, mm = config.POST_TIME.split(":")
-    job = sched.add_job(
-        post_job,
-        CronTrigger(hour=int(hh), minute=int(mm), timezone=tz),
-        id="daily_post",
-    )
+    sched = AsyncIOScheduler(timezone=ZoneInfo(config.TZ))
+    job = sched.add_job(post_job, build_post_trigger(), id="daily_post")
     set_scheduler(sched)
     sched.start()
 
