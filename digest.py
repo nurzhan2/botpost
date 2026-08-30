@@ -1,15 +1,14 @@
 # -*- coding: utf-8 -*-
 """Сборка дайджеста с учётом лимита Telegram (4096 символов на сообщение)."""
 from config import DIGEST_HEADER
+from filters import ensure_marker
 
 TG_LIMIT = 4096
 
 
 def normalize(item: str) -> str:
-    item = item.strip()
-    if not item.startswith("⏺️"):
-        item = "⏺️" + item
-    return item
+    """Один маркер в начале пункта. Логика маркеров живёт в filters.ensure_marker."""
+    return ensure_marker(item)
 
 
 def build_digest_messages(items):
