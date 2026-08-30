@@ -11,8 +11,8 @@ import unicodedata
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config import NEWS_MARKERS, SPAM_KEYWORDS          # noqa: E402
-from filters import is_news, special_reason             # noqa: E402
+from config import NEWS_MARKERS                          # noqa: E402
+from filters import is_news, special_reason, spam_hit    # noqa: E402
 
 # U+23FA BLACK CIRCLE FOR RECORD, с вариационным селектором и без него
 REC_PLAIN = "⏺"           # ⏺
@@ -116,10 +116,9 @@ def main():
     for i, (label, text) in enumerate(SAMPLES, 1):
         if not text:
             continue
-        low = text.lower()
-        hits = [k for k in SPAM_KEYWORDS if k in low]
-        if hits:
-            print("%-3d %-38s убит словами: %s" % (i, label, hits))
+        hit = spam_hit(text)
+        if hit:
+            print("%-3d %-38s убит шаблоном: %s" % (i, label, hit))
 
 
 if __name__ == "__main__":

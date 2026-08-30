@@ -17,7 +17,7 @@ from aiogram.types import Message
 
 import config
 import db
-from filters import is_news, special_reason
+from filters import is_news, special_reason, spam_hit
 from digest import build_digest_messages
 
 log = logging.getLogger(__name__)
@@ -70,9 +70,11 @@ async def on_channel_post(message: Message):
 
     if not is_news(text):
         # Разделяем две очень разные причины: спам-словарь vs отсутствие маркера
-        why = "spam" if text.strip() else "empty_text"
-        if text.strip() and not _looks_like_spam(text):
-            why = "no_marker"
+        if not text.strip():
+            why = "empty_text"
+        else:
+            hit = spam_hit(text)
+            why = ("spam(%s)" % hit) if hit else "no_marker"
         log.info("skip: %s | %s", why, ctx)
         return
 
@@ -80,12 +82,6 @@ async def on_channel_post(message: Message):
     kind = "special" if reason else "digest"
     db.add_to_queue("tg", message.chat.id, message.message_id, text, kind, reason or "")
     log.info("queued: %s%s | %s", kind, (" (%s)" % reason) if reason else "", ctx)
-
-
-def _looks_like_spam(text: str) -> bool:
-    """Только для логов: отличить «убит спам-словарём» от «нет маркера»."""
-    low = text.lower()
-    return any(k in low for k in config.SPAM_KEYWORDS)
 
 
 async def post_special():
@@ -135,6 +131,20 @@ async def post_digest():
     log.info("[post] digest_pending=%d oldest_age_days=%s ready=True posted=%d (сообщений=%d)",
              n, age, len(ids), sent)
     return len(ids)
+
+
+def check_filter_health():
+    """Если seen-записи есть, а в очередь за FLUSH_AFTER_DAYS дней не попало ничего —
+    почти наверняка фильтр режет 100% постов (разъехались маркеры)."""
+    seen = db.count_seen("tg") + db.count_seen("vk")
+    queued = db.count_queue_since(config.FLUSH_AFTER_DAYS)
+    if seen and not queued:
+        log.warning(
+            "фильтр отсёк 100%% постов, проверь маркеры: seen=%d, в очередь за %d дн. попало 0. "
+            "Смотри строки 'skip: no_marker' / 'skip: spam(...)' выше",
+            seen, config.FLUSH_AFTER_DAYS,
+        )
+    return seen, queued
 
 
 # ---------------------------------------------------------------- команды

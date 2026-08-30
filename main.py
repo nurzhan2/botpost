@@ -10,7 +10,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 import config
 import db
-from bot import bot, dp, post_special, post_digest, set_scheduler
+from bot import bot, dp, post_special, post_digest, set_scheduler, check_filter_health
 from vk_source import listen_vk
 
 log = logging.getLogger(__name__)
@@ -20,6 +20,7 @@ async def post_job():
     try:
         await post_special()   # особые новости — отдельными постами
         await post_digest()    # общий дайджест по 10 штук
+        check_filter_health()  # WARNING, если фильтр режет вообще всё
     except Exception as e:
         logging.exception("[post] error: %s", e)
 

@@ -104,6 +104,15 @@ def oldest_pending_age_days(kind):
     return (datetime.datetime.utcnow() - created).days
 
 
+def count_queue_since(days: int) -> int:
+    """Сколько записей вообще попало в очередь за последние N дней (включая опубликованные)."""
+    since = (datetime.datetime.utcnow() - datetime.timedelta(days=days)).isoformat()
+    con = _con()
+    n = con.execute("SELECT COUNT(*) FROM queue WHERE created_at >= ?", (since,)).fetchone()[0]
+    con.close()
+    return n
+
+
 def mark_posted(ids):
     con = _con()
     con.executemany("UPDATE queue SET posted=1 WHERE id=?", [(i,) for i in ids])
