@@ -32,6 +32,10 @@ def init():
         created_at TEXT,
         posted     INTEGER DEFAULT 0
     );
+    CREATE TABLE IF NOT EXISTS imported (
+        text_hash  TEXT PRIMARY KEY,   -- sha256 нормализованного текста
+        created_at TEXT
+    );
     """)
     con.commit()
     con.close()
@@ -145,6 +149,42 @@ def count_queue_since(days: int) -> int:
     n = con.execute("SELECT COUNT(*) FROM queue WHERE created_at >= ?", (since,)).fetchone()[0]
     con.close()
     return n
+
+
+def import_enqueue(text_hash, text, kind, reason="") -> bool:
+    """Импорт истории: поставить в очередь, если такого текста ещё не было.
+
+    Идемпотентность по хешу текста — повторный прогон того же экспорта ничего
+    не задваивает. chat_id/msg_id остаются NULL: у импортированных постов нет
+    живого оригинала в канале, копировать нечего, публикуем текстом.
+    Возвращает True, если запись добавлена.
+    """
+    con = _con()
+    try:
+        with con:
+            cur = con.execute(
+                "INSERT OR IGNORE INTO imported (text_hash, created_at) VALUES (?,?)",
+                (text_hash, datetime.datetime.utcnow().isoformat()),
+            )
+            if cur.rowcount == 0:
+                return False          # уже импортировали раньше
+            con.execute(
+                "INSERT INTO queue (source, chat_id, msg_id, text, kind, reason, created_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                ("import", None, None, text, kind, reason,
+                 datetime.datetime.utcnow().isoformat()),
+            )
+            return True
+    finally:
+        con.close()
+
+
+def queue_has_text(text) -> bool:
+    """Не лежит ли такой же текст уже в очереди (пересечение импорта с живой лентой)."""
+    con = _con()
+    row = con.execute("SELECT 1 FROM queue WHERE text=? LIMIT 1", (text,)).fetchone()
+    con.close()
+    return row is not None
 
 
 def mark_posted(ids):

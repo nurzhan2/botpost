@@ -131,4 +131,8 @@ VK_GROUP_ID = _env_int("VK_GROUP_ID", 240473090)   # id сообщества-б�
 # id беседы: открыть беседу в vk.com/im -> в адресе sel=cN, N это chat_id.
 # <=1 считается заглушкой и VK-поток не стартует вовсе (см. vk_source.vk_enabled).
 VK_CHAT_ID = _env_int("VK_CHAT_ID", 1)
-VK_START_DATE = "2026-04-15"   # с какой даты тянуть старьё при импорте
+VK_START_DATE = _env_str("VK_START_DATE", "2026-04-15")   # с какой даты тянуть старьё при импорте VK
+
+# ---------- Импорт истории Telegram ----------
+# Дата по умолчанию для import_history.py (--since её переопределяет).
+IMPORT_START_DATE = _env_str("IMPORT_START_DATE", "2026-04-15")
