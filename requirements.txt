@@ -1,3 +1,4 @@
 aiogram==3.13.1
 apscheduler==3.10.4
 vk_api==11.9.9
+tzdata==2026.3
