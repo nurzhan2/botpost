@@ -2,8 +2,14 @@
 """
 Обычный Telegram-бот (aiogram 3.x).
 
-Бот — АДМИН в канале-источнике @semyadruj и в канале-получателе @Friendl_family23.
+Бот — АДМИН в источнике @semyadruj и в канале-получателе @Friendl_family23.
 Ловит новые посты источника, фильтрует, копит и публикует.
+
+ВАЖНО про типы апдейтов:
+источник @semyadruj — СУПЕРГРУППА (type=supergroup), а не канал. Супергруппа
+шлёт `message`, канал шлёт `channel_post`. Раньше бот был подписан только на
+channel_post, Telegram отбрасывал все посты источника у себя, и до фильтров
+не доходило вообще ничего. Поэтому слушаем ОБА типа, а разбор у них общий.
 
 Ограничение Bot API: бот видит только НОВЫЕ посты (после добавления в админы).
 Старые новости заливаются отдельно через import_history.py.
@@ -41,8 +47,22 @@ def set_scheduler(sched):
     _scheduler = sched
 
 
+# --- буфер медиагрупп (альбомов) ---------------------------------------
+# Альбом прилетает НЕСКОЛЬКИМИ апдейтами с общим media_group_id, и подпись
+# есть только у одного из них — причём не обязательно у первого. Буфер общий
+# для обоих путей (channel_post и message), ключ включает chat_id, чтобы
+# media_group_id из разных чатов не смешались.
+ALBUM_DEBOUNCE_SEC = 2.0
+_album_buf = {}   # (chat_id, media_group_id) -> {"msgs": [Message], "task": Task}
+
+# Счётчик исходов с момента старта процесса. Нужен именно в памяти, а не в БД:
+# посты без маркера НЕ попадают в seen, поэтому по таблице seen нельзя понять
+# «мы что-то видели, но ничего не поставили в очередь».
+_stats = {"queued": 0, "spam": 0, "no_marker": 0, "empty_text": 0}
+
+
 def _is_source(message: Message) -> bool:
-    """Наш ли это канал-источник. При несовпадении логируем, ЧТО с ЧЕМ не сошлось."""
+    """Наш ли это чат-источник. При несовпадении логируем, ЧТО с ЧЕМ не сошлось."""
     # Числовой id — приоритетный и самый надёжный признак.
     if config.SOURCE_TG_CHAT_ID and message.chat.id == config.SOURCE_TG_CHAT_ID:
         return True
@@ -52,9 +72,10 @@ def _is_source(message: Message) -> bool:
         return True
 
     log.info(
-        "not_source: пришло chat.id=%s chat.username=%r title=%r; "
+        "not_source: пришло chat.id=%s chat.username=%r chat.type=%s title=%r; "
         "ожидали SOURCE_TG_CHAT_ID=%s SOURCE_TG_USERNAME=%r%s",
-        message.chat.id, message.chat.username, getattr(message.chat, "title", None),
+        message.chat.id, message.chat.username, message.chat.type,
+        getattr(message.chat, "title", None),
         config.SOURCE_TG_CHAT_ID, config.SOURCE_TG_USERNAME,
         "" if config.SOURCE_TG_CHAT_ID else
         " (id не задан — матч только по username; задай SOURCE_TG_CHAT_ID в env)",
@@ -62,61 +83,51 @@ def _is_source(message: Message) -> bool:
     return False
 
 
-# --- буфер медиагрупп (альбомов) ---------------------------------------
-# Альбом прилетает НЕСКОЛЬКИМИ channel_post с общим media_group_id, и подпись
-# есть только у одного из них — причём не обязательно у первого. Раньше каждое
-# сообщение проверялось поодиночке, у второго-десятого caption пустой -> is_news
-# False -> весь альбом терялся. Копим группу и обрабатываем целиком.
-ALBUM_DEBOUNCE_SEC = 2.0
-_album_buf = {}   # media_group_id -> {"msgs": [Message], "task": asyncio.Task}
-
-# Счётчик исходов с момента старта процесса. Нужен именно в памяти, а не в БД:
-# с версии G посты без маркера НЕ попадают в seen, поэтому по таблице seen
-# больше нельзя понять «мы что-то видели, но ничего не поставили в очередь».
-_stats = {"queued": 0, "spam": 0, "no_marker": 0, "empty_text": 0}
-
-
-def _ctx(message: Message) -> str:
+def _ctx(message: Message, origin: str) -> str:
     text = message.text or message.caption or ""
-    return "chat.id=%s chat.username=%s msg_id=%s media_group_id=%s text=%r" % (
-        message.chat.id, message.chat.username, message.message_id,
-        message.media_group_id, text[:80].replace("\n", " "),
+    return ("origin=%s chat.id=%s chat.username=%s chat.type=%s msg_id=%s "
+            "media_group_id=%s text=%r") % (
+        origin, message.chat.id, message.chat.username, message.chat.type,
+        message.message_id, message.media_group_id,
+        text[:80].replace("\n", " "),
     )
 
 
-@dp.channel_post()
-async def on_channel_post(message: Message):
-    """Новый пост в источнике -> фильтр -> очередь. Логируем КАЖДЫЙ шаг."""
-    ctx = _ctx(message)
+async def ingest(message: Message, origin: str):
+    """Единая точка входа для обоих типов апдейтов.
+
+    origin — только для логов: 'channel_post' (канал) либо 'message' (супергруппа).
+    """
+    ctx = _ctx(message, origin)
 
     if not _is_source(message):
         log.info("skip: not_source | %s", ctx)
         return
 
     if message.media_group_id:
-        _buffer_album(message, ctx)
+        _buffer_album(message, origin, ctx)
         return
 
     _handle(message, message.text or message.caption or "", [message.message_id], ctx)
 
 
-def _buffer_album(message: Message, ctx: str):
+def _buffer_album(message: Message, origin: str, ctx: str):
     """Накопить сообщение альбома и перевзвести таймер на разбор всей группы."""
-    gid = message.media_group_id
-    slot = _album_buf.setdefault(gid, {"msgs": [], "task": None})
+    key = (message.chat.id, message.media_group_id)
+    slot = _album_buf.setdefault(key, {"msgs": [], "task": None, "origin": origin})
     slot["msgs"].append(message)
     if slot["task"] is not None:
         slot["task"].cancel()
-    slot["task"] = asyncio.create_task(_flush_album_later(gid))
+    slot["task"] = asyncio.create_task(_flush_album_later(key))
     log.info("album: буферизую (в группе %d) | %s", len(slot["msgs"]), ctx)
 
 
-async def _flush_album_later(gid: str):
+async def _flush_album_later(key):
     try:
         await asyncio.sleep(ALBUM_DEBOUNCE_SEC)
     except asyncio.CancelledError:
         return   # пришло ещё одно фото группы — таймер перевзведён
-    slot = _album_buf.pop(gid, None)
+    slot = _album_buf.pop(key, None)
     if not slot or not slot["msgs"]:
         return
 
@@ -127,8 +138,8 @@ async def _flush_album_later(gid: str):
     carrier = next((m for m in msgs if (m.text or m.caption or "").strip()), msgs[0])
     text = carrier.text or carrier.caption or ""
     log.info("album: группа %s собрана, сообщений=%d, подпись у msg_id=%s",
-             gid, len(msgs), carrier.message_id)
-    _handle(carrier, text, ids, _ctx(carrier))
+             key[1], len(msgs), carrier.message_id)
+    _handle(carrier, text, ids, _ctx(carrier, slot["origin"]))
 
 
 def _handle(message: Message, text: str, all_ids: list, ctx: str):
@@ -137,7 +148,9 @@ def _handle(message: Message, text: str, all_ids: list, ctx: str):
     all_ids — все message_id, которые надо пометить seen (для альбома это вся
     группа: остальные кадры помечаются seen БЕЗ добавления в очередь).
     """
-    if db.is_seen("tg", message.message_id):
+    chat_id = message.chat.id
+
+    if db.is_seen("tg", chat_id, message.message_id):
         log.info("skip: seen | %s", ctx)
         return
 
@@ -152,7 +165,7 @@ def _handle(message: Message, text: str, all_ids: list, ctx: str):
         # no_marker/empty_text НЕ помечаем: если маркеры окажутся настроены
         # неверно, эти посты не будут навсегда похоронены в seen.
         if bucket == "spam":
-            db.mark_seen_many("tg", all_ids)
+            db.mark_seen_many("tg", chat_id, all_ids)
         _stats[bucket] += 1
         log.info("skip: %s | %s", why, ctx)
         return
@@ -161,11 +174,13 @@ def _handle(message: Message, text: str, all_ids: list, ctx: str):
     kind = "special" if reason else "digest"
     # seen + очередь одной транзакцией — см. db.mark_seen_and_enqueue
     db.mark_seen_and_enqueue(
-        "tg", all_ids, message.chat.id, message.message_id, text, kind, reason or "")
+        "tg", chat_id, all_ids, message.message_id, text, kind, reason or "")
     _stats["queued"] += 1
     log.info("queued: %s%s | seen_ids=%s | %s",
              kind, (" (%s)" % reason) if reason else "", all_ids, ctx)
 
+
+# ---------------------------------------------------- публикация
 
 async def post_special():
     """Особые новости — отдельными постами. Если есть оригинал — копируем с фото."""
@@ -217,29 +232,38 @@ async def post_digest():
 
 
 async def preflight():
-    """Один раз на старте: проверить, что бот видит оба канала и он там админ.
+    """Один раз на старте: проверить, что бот видит оба чата и он там админ.
 
     Без этого «бот запущен, ошибок нет, постов нет» неотличимо от «бот вообще
-    не админ в источнике и апдейтов оттуда не получает в принципе».
+    не админ в источнике» — или от «источник супергруппа, а мы слушаем канал».
     """
     me = await bot.get_me()
-    log.info("preflight: бот @%s (id=%s)", me.username, me.id)
+    log.info("preflight: бот @%s (id=%s) can_read_all_group_messages=%s",
+             me.username, me.id, me.can_read_all_group_messages)
+    log.info("preflight: allowed_updates=%s", dp.resolve_used_update_types())
 
     source_ref = config.SOURCE_TG_CHAT_ID or ("@" + config.SOURCE_TG_USERNAME)
-    for label, ref, need_admin in (
-        ("источник", source_ref, True),
-        ("получатель", config.TARGET_TG_CHANNEL, True),
-    ):
+    for label, ref, is_source in (("источник", source_ref, True),
+                                  ("получатель", config.TARGET_TG_CHANNEL, False)):
         try:
             chat = await bot.get_chat(ref)
         except Exception as e:
             log.error("preflight: %s %r НЕДОСТУПЕН: %s. "
-                      "Бот не добавлен в канал либо ссылка неверна — постов не будет.",
+                      "Бот не добавлен в чат либо ссылка неверна — постов не будет.",
                       label, ref, e)
             continue
 
-        log.info("preflight: %s ok — id=%s username=%r title=%r",
-                 label, chat.id, chat.username, chat.title)
+        log.info("preflight: %s ok — id=%s type=%s username=%r title=%r",
+                 label, chat.id, chat.type, chat.username, chat.title)
+
+        # Тип чата определяет ТИП АПДЕЙТА. Именно на этом бот молчал месяц.
+        if is_source:
+            if chat.type in ("group", "supergroup"):
+                log.info("preflight: источник — %s, посты придут как 'message'", chat.type)
+            elif chat.type == "channel":
+                log.info("preflight: источник — канал, посты придут как 'channel_post'")
+            else:
+                log.warning("preflight: неожиданный тип источника %r", chat.type)
 
         try:
             member = await bot.get_chat_member(chat.id, me.id)
@@ -249,9 +273,9 @@ async def preflight():
 
         status = getattr(member, "status", "?")
         status = getattr(status, "value", status)
-        if need_admin and status not in ("administrator", "creator"):
+        if status not in ("administrator", "creator"):
             log.warning("preflight: бот НЕ АДМИН в %s (%r), статус=%r. "
-                        "В источнике это значит, что channel_post оттуда не придёт вовсе; "
+                        "В источнике это значит, что посты оттуда не придут вовсе; "
                         "в получателе — что публикация упадёт.",
                         label, ref, status)
         else:
@@ -259,7 +283,7 @@ async def preflight():
 
 
 def check_filter_health():
-    """Если seen-записи есть, а в очередь за FLUSH_AFTER_DAYS дней не попало ничего —
+    """Если что-то приходило, а в очередь за FLUSH_AFTER_DAYS дней не попало ничего —
     почти наверняка фильтр режет 100% постов (разъехались маркеры)."""
     seen = db.count_seen("tg") + db.count_seen("vk")
     rejected = _stats["spam"] + _stats["no_marker"] + _stats["empty_text"]
@@ -276,6 +300,8 @@ def check_filter_health():
 
 
 # ---------------------------------------------------------------- команды
+# ВАЖНО: команды регистрируются РАНЬШЕ общего message-хендлера ниже,
+# иначе он перехватил бы /status и /testpost.
 
 def _admin_only(message: Message) -> bool:
     if not ADMIN_IDS:
@@ -314,11 +340,11 @@ async def cmd_status(message: Message):
         "",
         "БД: <code>%s</code>" % db_path,
         "размер БД: %s" % size_s,
-        "абсолютный путь: <code>%s</code>" % os.path.abspath(db_path),
         "",
         "следующий запуск: %s" % nxt,
         "источник: @%s (id=%s)" % (config.SOURCE_TG_USERNAME, config.SOURCE_TG_CHAT_ID),
         "получатель: %s" % config.TARGET_TG_CHANNEL,
+        "allowed_updates: %s" % (dp.resolve_used_update_types(),),
     ]
     await message.answer("\n".join(lines), parse_mode="HTML")
 
@@ -335,3 +361,18 @@ async def cmd_testpost(message: Message):
     except Exception as e:
         log.exception("[testpost] ошибка")
         await message.answer("Ошибка: %s" % e)
+
+
+# ------------------------------------------------- приём постов источника
+# Регистрируются ПОСЛЕ команд — см. комментарий выше.
+
+@dp.channel_post()
+async def on_channel_post(message: Message):
+    """Источник-канал (type=channel)."""
+    await ingest(message, "channel_post")
+
+
+@dp.message(F.chat.type.in_({"group", "supergroup"}))
+async def on_group_message(message: Message):
+    """Источник-супергруппа (type=supergroup) — именно этот путь и был потерян."""
+    await ingest(message, "message")

@@ -28,8 +28,10 @@ def _env_int(name, default):
 # Бот должен быть АДМИНОМ в обоих каналах.
 # Матч по числовому id надёжнее: username у канала можно сменить или снять,
 # и приватный канал username вообще не имеет.
+# ВНИМАНИЕ: источник — СУПЕРГРУППА (type=supergroup), а не канал.
+# Посты оттуда приходят апдейтом "message", а не "channel_post" — см. bot.py.
 SOURCE_TG_USERNAME = _env_str("SOURCE_TG_USERNAME", "semyadruj")   # https://t.me/semyadruj
-SOURCE_TG_CHAT_ID = _env_int("SOURCE_TG_CHAT_ID", 0)               # 0 = матчим по username
+SOURCE_TG_CHAT_ID = _env_int("SOURCE_TG_CHAT_ID", -1003661440984)  # 0 = матчим по username
 TARGET_TG_CHANNEL = _env_str("TARGET_TG_CHANNEL", "@Friendl_family23")  # https://t.me/Friendl_family23
 
 # ---------- Расписание ----------

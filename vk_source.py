@@ -53,10 +53,11 @@ def vk_enabled() -> bool:
 
 
 def _enqueue(text: str, mid):
-    if mid is not None and db.is_seen("vk", mid):
+    peer = _peer_id()
+    if mid is not None and db.is_seen("vk", peer, mid):
         return
     if mid is not None:
-        db.mark_seen("vk", mid)
+        db.mark_seen("vk", peer, mid)
     text = _mention_re.sub("", text or "").strip()
     if not is_news(text):
         return
@@ -150,9 +151,9 @@ def import_vk_history():
                 stop = True
                 break
             mid = m["id"]
-            if db.is_seen("vk", mid):
+            if db.is_seen("vk", peer, mid):
                 continue
-            db.mark_seen("vk", mid)
+            db.mark_seen("vk", peer, mid)
             text = _mention_re.sub("", m.get("text", "")).strip()
             if not is_news(text):
                 continue
