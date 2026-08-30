@@ -8,9 +8,11 @@
 Ограничение Bot API: бот видит только НОВЫЕ посты (после добавления в админы).
 Старые новости заливаются отдельно через import_history.py.
 """
+import logging
 import os
 
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command
 from aiogram.types import Message
 
 import config
@@ -18,8 +20,24 @@ import db
 from filters import is_news, special_reason
 from digest import build_digest_messages
 
+log = logging.getLogger(__name__)
+
 bot = Bot(os.environ["BOT_TOKEN"])
 dp = Dispatcher()
+
+# ADMIN_IDS=123456789,987654321 — кому доступны /status и /testpost
+ADMIN_IDS = {
+    int(x) for x in os.environ.get("ADMIN_IDS", "").replace(";", ",").split(",")
+    if x.strip().lstrip("-").isdigit()
+}
+
+# Планировщик прокидывается из main.py, нужен /status для «когда следующий запуск»
+_scheduler = None
+
+
+def set_scheduler(sched):
+    global _scheduler
+    _scheduler = sched
 
 
 def _is_source(message: Message) -> bool:
@@ -33,52 +51,147 @@ def _is_source(message: Message) -> bool:
 
 @dp.channel_post()
 async def on_channel_post(message: Message):
-    """Новый пост в источнике -> фильтр -> очередь."""
+    """Новый пост в источнике -> фильтр -> очередь. Логируем КАЖДЫЙ шаг."""
+    text = message.text or message.caption or ""
+    head = text[:80].replace("\n", " ")
+    ctx = "chat.id=%s chat.username=%s msg_id=%s media_group_id=%s text=%r" % (
+        message.chat.id, message.chat.username, message.message_id,
+        message.media_group_id, head,
+    )
+
     if not _is_source(message):
-        return  # это не наш источник (напр. эхо из канала-получателя)
+        log.info("skip: not_source | %s", ctx)
+        return
 
     if db.is_seen("tg", message.message_id):
+        log.info("skip: seen | %s", ctx)
         return
     db.mark_seen("tg", message.message_id)
 
-    text = message.text or message.caption or ""
-    if not is_news(text):          # спам/реклама/фото без текста — мимо
+    if not is_news(text):
+        # Разделяем две очень разные причины: спам-словарь vs отсутствие маркера
+        why = "spam" if text.strip() else "empty_text"
+        if text.strip() and not _looks_like_spam(text):
+            why = "no_marker"
+        log.info("skip: %s | %s", why, ctx)
         return
 
     reason = special_reason(text)
     kind = "special" if reason else "digest"
     db.add_to_queue("tg", message.chat.id, message.message_id, text, kind, reason or "")
+    log.info("queued: %s%s | %s", kind, (" (%s)" % reason) if reason else "", ctx)
+
+
+def _looks_like_spam(text: str) -> bool:
+    """Только для логов: отличить «убит спам-словарём» от «нет маркера»."""
+    low = text.lower()
+    return any(k in low for k in config.SPAM_KEYWORDS)
 
 
 async def post_special():
     """Особые новости — отдельными постами. Если есть оригинал — копируем с фото."""
-    for qid, chat_id, msg_id, text, _reason, _created in db.pending("special"):
+    rows = db.pending("special")
+    posted = 0
+    for qid, chat_id, msg_id, text, _reason, _created in rows:
         try:
             if chat_id and msg_id:
                 # copy_message переносит фото + подпись без пометки «переслано»
                 await bot.copy_message(config.TARGET_TG_CHANNEL, from_chat_id=chat_id, message_id=msg_id)
             else:
                 await bot.send_message(config.TARGET_TG_CHANNEL, text.strip(), disable_web_page_preview=True)
-        except Exception:
-            await bot.send_message(config.TARGET_TG_CHANNEL, text.strip(), disable_web_page_preview=True)
+        except Exception as e:
+            log.warning("[post] copy_message не прошёл для qid=%s (%s), шлю текстом", qid, e)
+            try:
+                await bot.send_message(config.TARGET_TG_CHANNEL, text.strip(), disable_web_page_preview=True)
+            except Exception:
+                log.exception("[post] не смог опубликовать special qid=%s, оставляю в очереди", qid)
+                continue
         db.mark_posted([qid])
+        posted += 1
+    log.info("[post] special=%d posted=%d", len(rows), posted)
+    return posted
 
 
 async def post_digest():
     """Дайджест: когда накопилось DIGEST_SIZE, либо старьё висит дольше FLUSH_AFTER_DAYS."""
     n = db.count_pending("digest")
-    if n == 0:
-        return
     age = db.oldest_pending_age_days("digest")
-    ready = n >= config.DIGEST_SIZE or (age is not None and age >= config.FLUSH_AFTER_DAYS)
+    ready = bool(n) and (n >= config.DIGEST_SIZE or (age is not None and age >= config.FLUSH_AFTER_DAYS))
+
     if not ready:
-        return
+        log.info("[post] digest_pending=%d oldest_age_days=%s ready=False posted=0", n, age)
+        return 0
 
     rows = db.pending("digest", limit=config.DIGEST_SIZE)
     ids = [r[0] for r in rows]
     items = [r[3] for r in rows]
 
+    sent = 0
     for message_text in build_digest_messages(items):
         await bot.send_message(config.TARGET_TG_CHANNEL, message_text, disable_web_page_preview=True)
+        sent += 1
 
     db.mark_posted(ids)
+    log.info("[post] digest_pending=%d oldest_age_days=%s ready=True posted=%d (сообщений=%d)",
+             n, age, len(ids), sent)
+    return len(ids)
+
+
+# ---------------------------------------------------------------- команды
+
+def _admin_only(message: Message) -> bool:
+    if not ADMIN_IDS:
+        log.warning("ADMIN_IDS не задан — команда %r отклонена", (message.text or "")[:20])
+        return False
+    return message.from_user is not None and message.from_user.id in ADMIN_IDS
+
+
+@dp.message(Command("status"), F.chat.type == "private")
+async def cmd_status(message: Message):
+    if not _admin_only(message):
+        return
+
+    db_path = db.DB
+    try:
+        size = os.path.getsize(db_path)
+        size_s = "%.1f KB" % (size / 1024)
+    except OSError as e:
+        size_s = "НЕТ ФАЙЛА (%s)" % e
+
+    nxt = "планировщик не подключён"
+    if _scheduler is not None:
+        jobs = _scheduler.get_jobs()
+        nxt = ", ".join("%s -> %s (tz=%s)" % (j.id, j.next_run_time, j.trigger.timezone)
+                        for j in jobs) or "джоб нет"
+
+    lines = [
+        "<b>Статус</b>",
+        "digest в очереди: %d" % db.count_pending("digest"),
+        "special в очереди: %d" % db.count_pending("special"),
+        "возраст самой старой (digest): %s дн." % db.oldest_pending_age_days("digest"),
+        "возраст самой старой (special): %s дн." % db.oldest_pending_age_days("special"),
+        "seen tg / vk: %d / %d" % (db.count_seen("tg"), db.count_seen("vk")),
+        "",
+        "БД: <code>%s</code>" % db_path,
+        "размер БД: %s" % size_s,
+        "абсолютный путь: <code>%s</code>" % os.path.abspath(db_path),
+        "",
+        "следующий запуск: %s" % nxt,
+        "источник: @%s (id=%s)" % (config.SOURCE_TG_USERNAME, config.SOURCE_TG_CHAT_ID),
+        "получатель: %s" % config.TARGET_TG_CHANNEL,
+    ]
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+@dp.message(Command("testpost"), F.chat.type == "private")
+async def cmd_testpost(message: Message):
+    if not _admin_only(message):
+        return
+    await message.answer("Запускаю post_special() + post_digest()…")
+    try:
+        s = await post_special()
+        d = await post_digest()
+        await message.answer("Готово: special опубликовано=%s, digest опубликовано=%s" % (s, d))
+    except Exception as e:
+        log.exception("[testpost] ошибка")
+        await message.answer("Ошибка: %s" % e)

@@ -43,6 +43,13 @@ def max_seen_id(source):
     con.close()
     return row[0] or 0
 
+def count_seen(source) -> int:
+    con = _con()
+    n = con.execute("SELECT COUNT(*) FROM seen WHERE source=?", (source,)).fetchone()[0]
+    con.close()
+    return n
+
+
 def is_seen(source, msg_id) -> bool:
     con = _con()
     row = con.execute("SELECT 1 FROM seen WHERE source=? AND msg_id=?", (source, msg_id)).fetchone()

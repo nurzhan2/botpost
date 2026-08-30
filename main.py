@@ -9,7 +9,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 import config
 import db
-from bot import bot, dp, post_special, post_digest
+from bot import bot, dp, post_special, post_digest, set_scheduler
 from vk_source import listen_vk
 
 
@@ -29,6 +29,7 @@ async def main():
     sched = AsyncIOScheduler(timezone=config.TZ)
     hh, mm = config.POST_TIME.split(":")
     sched.add_job(post_job, CronTrigger(hour=int(hh), minute=int(mm)))
+    set_scheduler(sched)
     sched.start()
 
     # VK читается в отдельном потоке (Long Poll блокирующий); если VK выключен — поток сразу выйдет
