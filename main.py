@@ -10,8 +10,9 @@ from apscheduler.triggers.cron import CronTrigger
 
 import config
 import db
-from bot import bot, dp, post_special, post_digest, set_scheduler, check_filter_health
-from vk_source import listen_vk
+from bot import (bot, dp, post_special, post_digest, set_scheduler,
+                 check_filter_health, preflight)
+from vk_source import listen_vk, vk_enabled
 
 log = logging.getLogger(__name__)
 
@@ -50,8 +51,14 @@ async def main():
     log.info("scheduler tz=%s, job tz=%s, next run=%s (POST_TIME=%s)",
              sched.timezone, job.trigger.timezone, job.next_run_time, config.POST_TIME)
 
-    # VK читается в отдельном потоке (Long Poll блокирующий); если VK выключен — поток сразу выйдет
-    threading.Thread(target=listen_vk, daemon=True).start()
+    # Проверяем доступ к каналам и права ДО того, как уйти в polling
+    await preflight()
+
+    # VK читается в отдельном потоке (Long Poll блокирующий).
+    # Поток вообще не поднимаем, если VK не настроен — иначе он падал бы
+    # по кругу и ежедневно засорял логи трейсбеками.
+    if vk_enabled():
+        threading.Thread(target=listen_vk, daemon=True).start()
 
     log.info("Бот запущен. Слушаю источник, публикация в %s", config.POST_TIME)
     await dp.start_polling(bot)

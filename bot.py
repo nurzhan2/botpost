@@ -203,6 +203,48 @@ async def post_digest():
     return len(ids)
 
 
+async def preflight():
+    """Один раз на старте: проверить, что бот видит оба канала и он там админ.
+
+    Без этого «бот запущен, ошибок нет, постов нет» неотличимо от «бот вообще
+    не админ в источнике и апдейтов оттуда не получает в принципе».
+    """
+    me = await bot.get_me()
+    log.info("preflight: бот @%s (id=%s)", me.username, me.id)
+
+    source_ref = config.SOURCE_TG_CHAT_ID or ("@" + config.SOURCE_TG_USERNAME)
+    for label, ref, need_admin in (
+        ("источник", source_ref, True),
+        ("получатель", config.TARGET_TG_CHANNEL, True),
+    ):
+        try:
+            chat = await bot.get_chat(ref)
+        except Exception as e:
+            log.error("preflight: %s %r НЕДОСТУПЕН: %s. "
+                      "Бот не добавлен в канал либо ссылка неверна — постов не будет.",
+                      label, ref, e)
+            continue
+
+        log.info("preflight: %s ok — id=%s username=%r title=%r",
+                 label, chat.id, chat.username, chat.title)
+
+        try:
+            member = await bot.get_chat_member(chat.id, me.id)
+        except Exception as e:
+            log.warning("preflight: не смог прочитать права в %s (%s): %s", label, ref, e)
+            continue
+
+        status = getattr(member, "status", "?")
+        status = getattr(status, "value", status)
+        if need_admin and status not in ("administrator", "creator"):
+            log.warning("preflight: бот НЕ АДМИН в %s (%r), статус=%r. "
+                        "В источнике это значит, что channel_post оттуда не придёт вовсе; "
+                        "в получателе — что публикация упадёт.",
+                        label, ref, status)
+        else:
+            log.info("preflight: права в %s — %s", label, status)
+
+
 def check_filter_health():
     """Если seen-записи есть, а в очередь за FLUSH_AFTER_DAYS дней не попало ничего —
     почти наверняка фильтр режет 100% постов (разъехались маркеры)."""
