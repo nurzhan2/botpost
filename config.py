@@ -1,11 +1,36 @@
 # -*- coding: utf-8 -*-
-"""Все настройки бота в одном месте."""
+"""Все настройки бота в одном месте.
+
+Источник и получатель можно переопределить переменными окружения — это
+надёжнее правки кода и не требует редеплоя репозитория:
+    SOURCE_TG_CHAT_ID=-1001234567890   (числовой id, самый надёжный матч)
+    SOURCE_TG_USERNAME=semyadruj
+    TARGET_TG_CHANNEL=@Friendl_family23
+Если переменной нет — берётся значение по умолчанию из этого файла.
+"""
+import os
+
+
+def _env_str(name, default):
+    v = os.environ.get(name, "").strip()
+    return v or default
+
+
+def _env_int(name, default):
+    v = os.environ.get(name, "").strip()
+    try:
+        return int(v) if v else default
+    except ValueError:
+        return default
+
 
 # ---------- Источник и получатель ----------
 # Бот должен быть АДМИНОМ в обоих каналах.
-SOURCE_TG_USERNAME = "semyadruj"          # источник: https://t.me/semyadruj
-SOURCE_TG_CHAT_ID = 0                      # можно указать числовой id канала (надёжнее), 0 = матчим по username
-TARGET_TG_CHANNEL = "@Friendl_family23"    # получатель: https://t.me/Friendl_family23
+# Матч по числовому id надёжнее: username у канала можно сменить или снять,
+# и приватный канал username вообще не имеет.
+SOURCE_TG_USERNAME = _env_str("SOURCE_TG_USERNAME", "semyadruj")   # https://t.me/semyadruj
+SOURCE_TG_CHAT_ID = _env_int("SOURCE_TG_CHAT_ID", 0)               # 0 = матчим по username
+TARGET_TG_CHANNEL = _env_str("TARGET_TG_CHANNEL", "@Friendl_family23")  # https://t.me/Friendl_family23
 
 # ---------- Расписание ----------
 TZ = "Europe/Moscow"

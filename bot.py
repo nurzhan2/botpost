@@ -42,11 +42,23 @@ def set_scheduler(sched):
 
 
 def _is_source(message: Message) -> bool:
+    """Наш ли это канал-источник. При несовпадении логируем, ЧТО с ЧЕМ не сошлось."""
+    # Числовой id — приоритетный и самый надёжный признак.
+    if config.SOURCE_TG_CHAT_ID and message.chat.id == config.SOURCE_TG_CHAT_ID:
+        return True
+
     username = (message.chat.username or "").lower()
     if config.SOURCE_TG_USERNAME and username == config.SOURCE_TG_USERNAME.lower():
         return True
-    if config.SOURCE_TG_CHAT_ID and message.chat.id == config.SOURCE_TG_CHAT_ID:
-        return True
+
+    log.info(
+        "not_source: пришло chat.id=%s chat.username=%r title=%r; "
+        "ожидали SOURCE_TG_CHAT_ID=%s SOURCE_TG_USERNAME=%r%s",
+        message.chat.id, message.chat.username, getattr(message.chat, "title", None),
+        config.SOURCE_TG_CHAT_ID, config.SOURCE_TG_USERNAME,
+        "" if config.SOURCE_TG_CHAT_ID else
+        " (id не задан — матч только по username; задай SOURCE_TG_CHAT_ID в env)",
+    )
     return False
 
 
