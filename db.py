@@ -75,6 +75,29 @@ def mark_seen_many(source, msg_ids):
     con.close()
 
 
+def mark_seen_and_enqueue(source, msg_ids, chat_id, msg_id, text, kind, reason=""):
+    """Пометить seen и поставить в очередь ОДНОЙ транзакцией.
+
+    Порознь их делать нельзя: если процесс умрёт между add_to_queue и
+    mark_seen, Telegram переотдаст неподтверждённый апдейт (offset не сдвинулся)
+    и новость встанет в очередь второй раз -> дубль в дайджесте.
+    """
+    con = _con()
+    try:
+        with con:   # commit при успехе, rollback при исключении
+            if msg_ids:
+                con.executemany("INSERT OR IGNORE INTO seen (source, msg_id) VALUES (?,?)",
+                                [(source, i) for i in msg_ids])
+            con.execute(
+                "INSERT INTO queue (source, chat_id, msg_id, text, kind, reason, created_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (source, chat_id, msg_id, text, kind, reason,
+                 datetime.datetime.utcnow().isoformat()),
+            )
+    finally:
+        con.close()
+
+
 def add_to_queue(source, chat_id, msg_id, text, kind, reason=""):
     con = _con()
     con.execute(

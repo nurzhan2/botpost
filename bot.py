@@ -70,6 +70,11 @@ def _is_source(message: Message) -> bool:
 ALBUM_DEBOUNCE_SEC = 2.0
 _album_buf = {}   # media_group_id -> {"msgs": [Message], "task": asyncio.Task}
 
+# Счётчик исходов с момента старта процесса. Нужен именно в памяти, а не в БД:
+# с версии G посты без маркера НЕ попадают в seen, поэтому по таблице seen
+# больше нельзя понять «мы что-то видели, но ничего не поставили в очередь».
+_stats = {"queued": 0, "spam": 0, "no_marker": 0, "empty_text": 0}
+
 
 def _ctx(message: Message) -> str:
     text = message.text or message.caption or ""
@@ -135,21 +140,29 @@ def _handle(message: Message, text: str, all_ids: list, ctx: str):
     if db.is_seen("tg", message.message_id):
         log.info("skip: seen | %s", ctx)
         return
-    db.mark_seen_many("tg", all_ids)
 
     if not is_news(text):
         # Разделяем две очень разные причины: спам-словарь vs отсутствие маркера
         if not text.strip():
-            why = "empty_text"
+            why, bucket = "empty_text", "empty_text"
         else:
             hit = spam_hit(text)
-            why = ("spam(%s)" % hit) if hit else "no_marker"
+            why, bucket = (("spam(%s)" % hit), "spam") if hit else ("no_marker", "no_marker")
+        # Спам отброшен ОСОЗНАННО — помечаем seen, чтобы не перемалывать.
+        # no_marker/empty_text НЕ помечаем: если маркеры окажутся настроены
+        # неверно, эти посты не будут навсегда похоронены в seen.
+        if bucket == "spam":
+            db.mark_seen_many("tg", all_ids)
+        _stats[bucket] += 1
         log.info("skip: %s | %s", why, ctx)
         return
 
     reason = special_reason(text)
     kind = "special" if reason else "digest"
-    db.add_to_queue("tg", message.chat.id, message.message_id, text, kind, reason or "")
+    # seen + очередь одной транзакцией — см. db.mark_seen_and_enqueue
+    db.mark_seen_and_enqueue(
+        "tg", all_ids, message.chat.id, message.message_id, text, kind, reason or "")
+    _stats["queued"] += 1
     log.info("queued: %s%s | seen_ids=%s | %s",
              kind, (" (%s)" % reason) if reason else "", all_ids, ctx)
 
@@ -249,11 +262,14 @@ def check_filter_health():
     """Если seen-записи есть, а в очередь за FLUSH_AFTER_DAYS дней не попало ничего —
     почти наверняка фильтр режет 100% постов (разъехались маркеры)."""
     seen = db.count_seen("tg") + db.count_seen("vk")
+    rejected = _stats["spam"] + _stats["no_marker"] + _stats["empty_text"]
     queued = db.count_queue_since(config.FLUSH_AFTER_DAYS)
-    if seen and not queued:
+    if (seen or rejected) and not queued:
         log.warning(
-            "фильтр отсёк 100%% постов, проверь маркеры: seen=%d, в очередь за %d дн. попало 0. "
-            "Смотри строки 'skip: no_marker' / 'skip: spam(...)' выше",
+            "фильтр отсёк 100%% постов, проверь маркеры: отклонено=%d "
+            "(no_marker=%d spam=%d empty=%d), seen=%d, в очередь за %d дн. попало 0. "
+            "Смотри строки 'skip: ...' выше",
+            rejected, _stats["no_marker"], _stats["spam"], _stats["empty_text"],
             seen, config.FLUSH_AFTER_DAYS,
         )
     return seen, queued
@@ -293,6 +309,8 @@ async def cmd_status(message: Message):
         "возраст самой старой (digest): %s дн." % db.oldest_pending_age_days("digest"),
         "возраст самой старой (special): %s дн." % db.oldest_pending_age_days("special"),
         "seen tg / vk: %d / %d" % (db.count_seen("tg"), db.count_seen("vk")),
+        "с момента старта: queued=%d no_marker=%d spam=%d empty=%d" % (
+            _stats["queued"], _stats["no_marker"], _stats["spam"], _stats["empty_text"]),
         "",
         "БД: <code>%s</code>" % db_path,
         "размер БД: %s" % size_s,
